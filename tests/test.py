@@ -1008,7 +1008,6 @@ async def test_dynamic_properties_async(accept_types, tuberd_host):
         ctx.set_STATIC("async ctx static value")
         ctx.set_COMPUTED("async ctx computed value")
         ctx.set_MUTABLE("async ctx mutable value")
-    await asyncio.sleep(0)  # let asyncio done-callbacks run before checking cache
-    assert obj.STATIC == "async ctx static value"  # cache updated via done-callback
+    assert obj.STATIC == "async ctx static value"  # cache updated synchronously in __aexit__
     assert await obj.COMPUTED == "async ctx computed value"
     assert await obj.MUTABLE == "async ctx mutable value"

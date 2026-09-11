@@ -367,13 +367,9 @@ class SimpleContext:
                     if _is_static:
 
                         def update_cache(f):
-                            try:
-                                f.result()
-                                object.__setattr__(obj, _prop, value)
-                            except Exception:
-                                pass
+                            object.__setattr__(obj, _prop, value)
 
-                        fut.add_done_callback(update_cache)
+                        fut._sync_callbacks = [update_cache]
                     return fut
 
                 setattr(self, name, property_setter)
@@ -527,6 +523,10 @@ class SimpleContext:
             else:
                 if haskey(r, "result"):
                     f.set_result(getkey(r, "result"))
+                    # Run sync callbacks only on success, so cache is never
+                    # updated when the server-side set was rejected.
+                    for cb in getattr(f, "_sync_callbacks", ()):
+                        cb(f)
                 else:
                     f.set_exception(TuberError("Result has no 'result' attribute"))
 
