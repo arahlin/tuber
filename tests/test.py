@@ -17,6 +17,7 @@ if os.getenv("CMAKE_TEST"):
 else:
     from tuber.tests import test_module as tm
 
+from tuber import TuberStateError
 from tuber.server import TuberContainer, TuberArray
 
 
@@ -51,6 +52,28 @@ class ObjectWithPrivateMethod:
 class ObjectWithContainerProperties:
     property_objects = TuberArray([ObjectWithProperty(), ObjectWithProperty()])
     method_objects = TuberArray({"a": ObjectWithMethod(), "b": ObjectWithMethod()})
+
+
+class ObjectWithDynamicProperties:
+    """Object with both static and dynamic properties."""
+
+    STATIC = "static value"
+
+    # Python @property: automatically treated as dynamic
+    @property
+    def COMPUTED(self):
+        return self._computed
+
+    @COMPUTED.setter
+    def COMPUTED(self, value):
+        self._computed = value
+
+    # Opt-in dynamic via __tuber_dynamic__
+    __tuber_dynamic__ = {"MUTABLE"}
+    MUTABLE = "initial value"
+
+    def __init__(self):
+        self._computed = "computed value"
 
 
 class Types:
@@ -134,6 +157,7 @@ registry = {
         [TuberArray([ObjectWithContainerProperties()]), TuberArray([ObjectWithContainerProperties])]
     ),
     "Container": TuberContainer({"a": ObjectWithProperty(), "b": ObjectWithMethod()}),
+    "ObjectWithDynamicProperties": ObjectWithDynamicProperties(),
     "Types": Types(),
     "NumPy": NumPy(),
     "Warnings": WarningsClass(),
@@ -163,7 +187,9 @@ def Failed(warnings=None, **kwargs):
     return dict(error=kwargs)
 
 
-container_success = Succeeded(__doc__=TuberArray.__doc__.strip(), methods=["tuber_call", "tuber_meta"], properties=[])
+container_success = Succeeded(
+    __doc__=TuberArray.__doc__.strip(), methods=["tuber_call", "tuber_meta"], properties=[], dynamic_properties=[]
+)
 
 
 def test_empty_request_array(tuber_call):
@@ -172,26 +198,30 @@ def test_empty_request_array(tuber_call):
 
 def test_describe(tuber_call):
     assert tuber_call(json={}) == Succeeded(objects=list(registry))
-    assert tuber_call(object="ObjectWithPrivateMethod") == Succeeded(__doc__=None, methods=[], properties=[])
+    assert tuber_call(object="ObjectWithPrivateMethod") == Succeeded(
+        __doc__=None, methods=[], properties=[], dynamic_properties=[]
+    )
 
     assert tuber_call(object="ObjectWithContainerProperties", property="property_objects") == container_success
     assert tuber_call(object=["ObjectWithContainerProperties", "property_objects"]) == container_success
     assert tuber_call(object="ObjectWithContainerProperties", property="method_objects") == container_success
     assert tuber_call(object=["ObjectWithContainerProperties", ("property_objects", 0)]) == Succeeded(
-        __doc__=None, methods=[], properties=["PROPERTY"]
+        __doc__=None, methods=[], properties=["PROPERTY"], dynamic_properties=[]
     )
     assert tuber_call(object=["ObjectWithContainerProperties", ("method_objects", "a")]) == Succeeded(
-        __doc__=None, methods=["method"], properties=[]
+        __doc__=None, methods=["method"], properties=[], dynamic_properties=[]
     )
 
     assert tuber_call(object="ObjectList") == container_success
     assert tuber_call(object=[("ObjectListList", 0)]) == container_success
     assert tuber_call(object="ObjectDict") == container_success
-    assert tuber_call(object=[("ObjectDict", "a")]) == Succeeded(__doc__=None, methods=[], properties=[])
+    assert tuber_call(object=[("ObjectDict", "a")]) == Succeeded(
+        __doc__=None, methods=[], properties=[], dynamic_properties=[]
+    )
 
 
 def test_fetch_null_metadata(tuber_call):
-    assert tuber_call(object="NullObject") == Succeeded(__doc__=None, methods=[], properties=[])
+    assert tuber_call(object="NullObject") == Succeeded(__doc__=None, methods=[], properties=[], dynamic_properties=[])
 
 
 def test_call_nonexistent_object(tuber_call):
@@ -909,3 +939,76 @@ async def test_tuberpy_method(resolve):
     r2 = await tuber_result(s2.ObjectWithDictMethod.method())
     assert r2["a"] == "expected return value"
     assert r2["b"] == "expected return value"
+
+
+def test_dynamic_properties_protocol(tuber_call):
+    """Static properties appear in 'properties'; dynamic ones in 'dynamic_properties'."""
+    result = tuber_call(object="ObjectWithDynamicProperties")["result"]
+    assert "STATIC" in result["properties"]
+    assert "COMPUTED" in result["dynamic_properties"]
+    assert "MUTABLE" in result["dynamic_properties"]
+    assert "COMPUTED" not in result["properties"]
+    assert "MUTABLE" not in result["properties"]
+
+
+def test_dynamic_properties_simple(accept_types, tuberd_host):
+    """Static property is cached; dynamic properties are fetched/set live."""
+    s = tuber.resolve_simple(tuberd_host, accept_types=accept_types)
+    obj = s.ObjectWithDynamicProperties
+
+    # Static property: assignment pushes to server and updates local cache
+    obj.STATIC = "simple static updated"
+    assert obj.STATIC == "simple static updated"
+
+    # set_NAME() method also works for static properties
+    obj.set_STATIC("simple static via setter")
+    assert obj.STATIC == "simple static via setter"
+
+    # Dynamic @property: assignment pushes to server; next read reflects it
+    obj.COMPUTED = "simple new value"
+    assert obj.COMPUTED == "simple new value"
+
+    # Dynamic __tuber_dynamic__ property: same round-trip behaviour
+    obj.MUTABLE = "simple mutated"
+    assert obj.MUTABLE == "simple mutated"
+
+    # set_NAME() works inside a context for both static and dynamic properties
+    with obj.tuber_context() as ctx:
+        ctx.set_STATIC("ctx static value")
+        ctx.set_COMPUTED("ctx computed value")
+        ctx.set_MUTABLE("ctx mutable value")
+    assert obj.STATIC == "ctx static value"  # cache updated via done-callback
+    assert obj.COMPUTED == "ctx computed value"  # fetched live
+    assert obj.MUTABLE == "ctx mutable value"  # fetched live
+
+
+@pytest.mark.asyncio
+async def test_dynamic_properties_async(accept_types, tuberd_host):
+    """Async TuberObject: property access returns a coroutine; set_NAME sets."""
+    s = await tuber.resolve(tuberd_host, accept_types=accept_types)
+    obj = s.ObjectWithDynamicProperties
+
+    # Static property: set_NAME() pushes to server and updates local cache
+    await obj.set_STATIC("async static updated")
+    assert obj.STATIC == "async static updated"
+
+    # Assignment on a static property raises TuberStateError
+    with pytest.raises(TuberStateError):
+        obj.STATIC = "should raise"
+
+    # Dynamic property getter returns a coroutine; must be awaited
+    await obj.set_COMPUTED("async computed value")
+    assert await obj.COMPUTED == "async computed value"
+
+    await obj.set_MUTABLE("async mutable value")
+    assert await obj.MUTABLE == "async mutable value"
+
+    # set_NAME() works inside an async context for both static and dynamic properties
+    async with obj.tuber_context() as ctx:
+        ctx.set_STATIC("async ctx static value")
+        ctx.set_COMPUTED("async ctx computed value")
+        ctx.set_MUTABLE("async ctx mutable value")
+    await asyncio.sleep(0)  # let asyncio done-callbacks run before checking cache
+    assert obj.STATIC == "async ctx static value"  # cache updated via done-callback
+    assert await obj.COMPUTED == "async ctx computed value"
+    assert await obj.MUTABLE == "async ctx mutable value"

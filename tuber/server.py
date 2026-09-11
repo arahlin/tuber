@@ -115,6 +115,20 @@ def check_attribute(obj, d):
     return True
 
 
+def is_dynamic_property(obj, name):
+    """
+    Return True if the named attribute should be treated as a dynamic property
+    (fetched from and pushed to the server on every client access).
+
+    An attribute is dynamic if it is a Python ``@property`` descriptor on the
+    class, or if its name appears in the object's ``__tuber_dynamic__`` set.
+    """
+    cls_attr = getattr(type(obj), name, None)
+    if isinstance(cls_attr, property):
+        return True
+    return name in getattr(obj, "__tuber_dynamic__", set())
+
+
 def resolve_object(obj, recursive=True):
     """
     Return a dictionary of all valid object attributes classified by type.
@@ -123,18 +137,21 @@ def resolve_object(obj, recursive=True):
 
     objects: TuberContainer objects that are to be further resolved
     methods: Callable attributes
-    properties: Static property attributes
+    properties: Static property attributes (cached on the client after resolve)
+    dynamic_properties: Dynamic property attributes (fetched/set on each client access)
     """
 
     if recursive:
         objects = {}
         methods = {}
         props = {}
+        dynamic_props = {}
     else:
         methods = []
         props = []
+        dynamic_props = []
 
-    out = dict(__doc__=inspect.getdoc(obj), methods=methods, properties=props)
+    out = dict(__doc__=inspect.getdoc(obj), methods=methods, properties=props, dynamic_properties=dynamic_props)
 
     for d in dir(obj):
         # Don't export dunder methods or attributes - this avoids exporting
@@ -154,7 +171,10 @@ def resolve_object(obj, recursive=True):
                     pass
                 methods[d] = resolve_method(attr, bound=bound)
             else:
-                props[d] = attr
+                if is_dynamic_property(obj, d):
+                    dynamic_props[d] = attr
+                else:
+                    props[d] = attr
         else:
             if getattr(attr, "__tuber_object__", False):
                 # ignore nested objects when not recursing
@@ -162,7 +182,10 @@ def resolve_object(obj, recursive=True):
             if callable(attr):
                 methods.append(d)
             else:
-                props.append(d)
+                if is_dynamic_property(obj, d):
+                    dynamic_props.append(d)
+                else:
+                    props.append(d)
 
     if not recursive:
         return out
@@ -612,6 +635,11 @@ class RequestHandler:
             # Sanity check
             if not hasattr(obj, propertyname):
                 raise AttributeError(f"'{objname}' object has no attribute '{propertyname}'")
+
+            # Property setter: "value" key in request means set the attribute on the server
+            if "value" in request:
+                setattr(obj, propertyname, request["value"])
+                return result_response()
 
             # Returning a method description or property evaluation
             attr = getattr(obj, propertyname)

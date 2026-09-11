@@ -11,28 +11,30 @@ class DeviceDriver:
     # methods and attributes
     __tuber_object__ = True
 
-    # Exclude certain attributes from being sent over the network to
-    # any clients.  Typically these are complex objects (e.g. serial devices)
-    # that would throw a "circular reference error" or similar.
-    __tuber_exclude__ = ["button", "knob"]
+    # Static property: cached on the client once at resolve time.
+    MODEL = "XR-7000"
+
+    # Dynamic @property: the descriptor signals to tuber that this attribute
+    # should be fetched from or pushed to the server on every client access.
+    @property
+    def button(self):
+        return self._button
+
+    @button.setter
+    def button(self, value):
+        self._button = bool(value)
+
+    # Opt-in dynamic property: listed in __tuber_dynamic__ so tuber treats it
+    # as a live server-side value rather than caching it on the client.
+    __tuber_dynamic__ = {"knob"}
 
     def __init__(self):
-        self.button = False
+        self._button = False
         self.knob = 1
 
     def push_button(self):
         self.button = not self.button
         return self.button
-
-    def set_knob(self, value: int):
-        self.knob = value
-        return self.knob
-
-    def get_button(self):
-        return self.button
-
-    def get_knob(self):
-        return self.knob
 
     def get_all(self):
         return {"button": self.button, "knob": self.knob}

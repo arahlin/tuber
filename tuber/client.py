@@ -354,6 +354,31 @@ class SimpleContext:
         if attribute_blacklisted(name):
             raise AttributeError(f"{name} is not a valid method or property!")
 
+        # If name matches set_PROP for a known property, queue a setter call
+        # rather than a method call.
+        if name.startswith("set_"):
+            prop = name[4:]
+            obj = self.obj
+            if prop in obj._dynamic_property_names() or prop in obj._static_property_names():
+                is_static = prop in obj._static_property_names()
+
+                def property_setter(value, _prop=prop, _is_static=is_static):
+                    fut = self._add_call(object=obj._tuber_objname, property=_prop, value=value)
+                    if _is_static:
+
+                        def update_cache(f):
+                            try:
+                                f.result()
+                                object.__setattr__(obj, _prop, value)
+                            except Exception:
+                                pass
+
+                        fut.add_done_callback(update_cache)
+                    return fut
+
+                setattr(self, name, property_setter)
+                return property_setter
+
         # Queue methods of registry entries using the top-level registry context
         if self.obj._tuber_objname is None:
             ctx = SubContext([name], parent=self)
@@ -882,9 +907,61 @@ class SimpleTuberObject:
     def __repr__(self):
         return f"{self.__class__.__name__}({self._tuber_objname!r}, hostname={self._tuber_host!r})"
 
+    def _dynamic_property_names(self):
+        """Return the list of dynamic property names from resolved metadata, or [] if not yet resolved."""
+        try:
+            meta = super().__getattribute__("_tuber_meta")
+            return meta["dynamic_properties"] if meta else []
+        except (AttributeError, KeyError):
+            return []
+
+    def _static_property_names(self):
+        """Return the list of static property names from resolved metadata, or [] if not yet resolved."""
+        try:
+            meta = super().__getattribute__("_tuber_meta")
+            return meta["properties"] if meta else []
+        except (AttributeError, KeyError):
+            return []
+
     def __getattr__(self, name: str):
-        # Useful hint
+        """Fetch dynamic properties live from the server; raise for anything else."""
+        if attribute_blacklisted(name):
+            raise AttributeError(f"'{name}' is not a valid attribute!")
+        if name in self._dynamic_property_names():
+            return self._fetch_property(name)
         raise AttributeError(f"'{self._tuber_objname}' has no attribute '{name}'.  Did you run tuber_resolve()?")
+
+    def __setattr__(self, name: str, value):
+        """Push dynamic and static properties to the server (static also updates the local cache)."""
+        if name in self._dynamic_property_names() or name in self._static_property_names():
+            self._push_property(name, value)
+            return
+        super().__setattr__(name, value)
+
+    def __dir__(self):
+        """Extend the default dir() listing with dynamic property names."""
+        return list(super().__dir__()) + self._dynamic_property_names()
+
+    def _fetch_property(self, name: str):
+        """Fetch a single property value from the server synchronously."""
+        with self.tuber_context(convert_json=self._convert_json, return_exceptions=False) as ctx:
+            r = ctx._add_call(object=self._tuber_objname, property=name)
+        return r.result()
+
+    def _push_property(self, name: str, value):
+        """Push a property value to the server; cache is updated via done-callback for static properties."""
+        with self.tuber_context(convert_json=False, return_exceptions=False) as ctx:
+            getattr(ctx, f"set_{name}")(value)
+
+    @staticmethod
+    def _resolve_property(name: str, meta: dict):
+        """Resolve a property into a sync setter (cache is updated by _push_property for static properties)."""
+
+        def setter(self, value):
+            self._push_property(name, value)
+
+        setter.__name__ = f"set_{name}"
+        return tuber_wrapper(setter, meta)
 
     def __len__(self):
         try:
@@ -970,7 +1047,13 @@ class SimpleTuberObject:
 
         # keep track of existing remote attributes
         if self._tuber_meta is None:
-            self._tuber_meta = {"objects": [], "methods": [], "properties": [], "container": False}
+            self._tuber_meta = {
+                "objects": [],
+                "methods": [],
+                "properties": [],
+                "dynamic_properties": [],
+                "container": False,
+            }
 
         # object attributes
         objects = meta.setdefault("objects", {})
@@ -1010,11 +1093,14 @@ class SimpleTuberObject:
 
                 setattr(self, k, types.MethodType(v, self))
 
-        # static properties
+        # static properties: cached at resolve time
         properties = meta.setdefault("properties", {})
-        # remove any properties that are no longer on the remote
+        # remove any static properties that are no longer on the remote
         for k in set(self._tuber_meta["properties"]) - set(properties):
-            delattr(self, k)
+            if k in self.__dict__:
+                delattr(self, k)
+            if f"set_{k}" in self.__dict__:
+                delattr(self, f"set_{k}")
         if properties:
             # same workaround as above
             if isinstance(properties, list):
@@ -1034,6 +1120,19 @@ class SimpleTuberObject:
 
             for k, v in properties.items():
                 setattr(self, k, recurse(v) if self._convert_json else v)
+                setter = self._resolve_property(k, {})
+                setattr(self, f"set_{k}", types.MethodType(setter, self))
+
+        # dynamic properties: names tracked; values fetched/pushed on each access
+        dynamic_properties = meta.setdefault("dynamic_properties", {})
+        if dynamic_properties and isinstance(dynamic_properties, list):
+            dynamic_properties = meta["dynamic_properties"] = dict.fromkeys(dynamic_properties)
+        for k in set(self._tuber_meta["dynamic_properties"]) - set(dynamic_properties):
+            if f"set_{k}" in self.__dict__:
+                delattr(self, f"set_{k}")
+        for k, v in dynamic_properties.items():
+            setter = self._resolve_property(k, v if isinstance(v, dict) else {})
+            setattr(self, f"set_{k}", types.MethodType(setter, self))
 
         # Discard any container attributes from a previous resolve before
         # rebuilding: changes may have been structural (e.g. dict-like to
@@ -1079,9 +1178,16 @@ class SimpleTuberObject:
                 """
                 if keys is None:
                     if isinstance(self._items, list):
-                        keys = range(len(self._items))
+                        keys = list(range(len(self._items)))
                     else:
-                        keys = self._items.keys()
+                        keys = list(self._items.keys())
+                # Dynamic properties must be fetched from the server; static
+                # properties are cached locally after resolve.
+                first = self._items[keys[0]] if keys else None
+                if first is not None and name in first._dynamic_property_names():
+                    with SimpleContext(self, convert_json=self._convert_json, return_exceptions=False) as ctx:
+                        futures = [ctx._add_call(object=self._items[k]._tuber_objname, property=name) for k in keys]
+                    return [f.result() for f in futures]
                 return [getattr(self._items[k], name) for k in keys]
 
             setattr(self, "tuber_get", types.MethodType(tuber_get, self))
@@ -1091,6 +1197,7 @@ class SimpleTuberObject:
             "objects": list(meta["objects"]),
             "methods": list(meta["methods"]),
             "properties": list(meta["properties"]),
+            "dynamic_properties": list(meta["dynamic_properties"]),
             "container": meta["values"] is not None,
         }
         self._tuber_resolved = True
@@ -1124,6 +1231,39 @@ class TuberObject(SimpleTuberObject):
             meta = meta[0]
 
         self._resolve_meta(meta)
+
+    def __setattr__(self, name: str, value):
+        """Raise TuberStateError for any property assignment; use await obj.set_NAME() instead."""
+        if name in self._dynamic_property_names() or name in self._static_property_names():
+            raise TuberStateError(
+                f"Cannot set property '{name}' with assignment on an async TuberObject. "
+                f"Use `await obj.set_{name}(value)` instead."
+            )
+        super().__setattr__(name, value)
+
+    async def _fetch_property(self, name: str):
+        """Fetch a single property value from the server asynchronously."""
+        async with self.tuber_context(convert_json=self._convert_json, return_exceptions=False) as ctx:
+            ctx._add_call(object=self._tuber_objname, property=name)
+            results = await ctx()
+        return results[0]
+
+    async def _push_property(self, name: str, value):
+        """Push a property value to the server; also update the local cache for static properties."""
+        async with self.tuber_context(convert_json=False, return_exceptions=False) as ctx:
+            getattr(ctx, f"set_{name}")(value)
+        if name in self._static_property_names():
+            object.__setattr__(self, name, value)
+
+    @staticmethod
+    def _resolve_property(name: str, meta: dict):
+        """Resolve a property into an async setter (cache is updated by _push_property for static properties)."""
+
+        async def setter(self, value):
+            await self._push_property(name, value)
+
+        setter.__name__ = f"set_{name}"
+        return tuber_wrapper(setter, meta)
 
     @staticmethod
     def _resolve_method(name: str, meta: dict):
