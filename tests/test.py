@@ -891,6 +891,101 @@ def test_tuberpy_simple_context_timeout(accept_types, tuberd_host):
         assert r1.result() == 0.1
 
 
+def test_tuberpy_simple_warnings_after_timeout(accept_types, tuberd_host):
+    """Warnings still reach the caller when the response arrives after a timed-out
+    wait, and the batch is resolved in the background."""
+    s = resolve_simple(tuberd_host, accept_types=accept_types)
+
+    with pytest.warns(match="This is a warning"):
+        with s.tuber_context() as ctx:
+            r1 = ctx.Warnings.single_warning("This is a warning")
+            r2 = ctx.SlowObject.sleep(0.5)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                r2.result(timeout=0.1)
+
+            assert r1.result() is True
+
+
+@pytest.mark.asyncio
+async def test_tuberpy_async_warnings_after_timeout(accept_types, tuberd_host):
+    """Warnings reach the awaiting task when the batch was flushed in a
+    background task (here, by a timed-out wait on another call)."""
+    s = await tuber.resolve(tuberd_host, accept_types=accept_types)
+
+    async with s.tuber_context() as ctx:
+        r1 = ctx.Warnings.single_warning("This is a warning")
+        r2 = ctx.SlowObject.sleep(0.5)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(r2, timeout=0.1)
+
+        with pytest.warns(match="This is a warning"):
+            assert (await r1) is True
+
+
+def test_tuberpy_simple_warnings_emitted_once(accept_types, tuberd_host):
+    """A response's warnings are emitted once, however often it's collected."""
+    s = resolve_simple(tuberd_host, accept_types=accept_types)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with s.tuber_context() as ctx:
+            ctx.Warnings.single_warning("This is a warning")
+            response = ctx.send()
+            assert ctx.receive(response)[0] is True
+            assert ctx.receive(response)[0] is True
+
+    assert [str(w.message) for w in caught] == ["This is a warning"]
+
+
+def test_tuberpy_simple_warnings_per_call(accept_types, tuberd_host):
+    """A call's warnings are emitted when its own result is retrieved."""
+    s = resolve_simple(tuberd_host, accept_types=accept_types)
+
+    with s.tuber_context() as ctx:
+        r1 = ctx.Warnings.single_warning("First warning")
+        r2 = ctx.Warnings.single_warning("Second warning")
+
+        with warnings.catch_warnings(record=True) as first:
+            warnings.simplefilter("always")
+            assert r1.result() is True
+        with warnings.catch_warnings(record=True) as second:
+            warnings.simplefilter("always")
+            assert r2.result() is True
+
+    assert [str(w.message) for w in first] == ["First warning"]
+    assert [str(w.message) for w in second] == ["Second warning"]
+
+
+@pytest.mark.asyncio
+async def test_tuberpy_async_warnings_per_call(accept_types, tuberd_host):
+    """A call's warnings are emitted when it's awaited."""
+    s = await tuber.resolve(tuberd_host, accept_types=accept_types)
+
+    async with s.tuber_context() as ctx:
+        r1 = ctx.Warnings.single_warning("First warning")
+        r2 = ctx.Warnings.single_warning("Second warning")
+
+        with warnings.catch_warnings(record=True) as first:
+            warnings.simplefilter("always")
+            assert (await r1) is True
+        with warnings.catch_warnings(record=True) as second:
+            warnings.simplefilter("always")
+            assert (await r2) is True
+
+    assert [str(w.message) for w in first] == ["First warning"]
+    assert [str(w.message) for w in second] == ["Second warning"]
+
+
+def test_tuberpy_simple_request_future_warnings(accept_types, tuberd_host):
+    """Retrieving the future that send() returns emits its calls' warnings."""
+    s = resolve_simple(tuberd_host, accept_types=accept_types)
+
+    with pytest.warns(match="This is a warning"):
+        with s.tuber_context() as ctx:
+            ctx.Warnings.single_warning("This is a warning")
+            assert ctx.send().result().tuber_results == [True]
+
+
 # RFC 5737 TEST-NET-1: routable but unreachable, reliably triggers connect timeouts.
 UNREACHABLE_HOST = "192.0.2.1:80"
 

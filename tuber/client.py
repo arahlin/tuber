@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import concurrent
 import textwrap
+import threading
 import types
 import warnings
 import inspect
@@ -248,11 +249,39 @@ class SubContext:
         return caller
 
 
+class CallWarnings:
+    """Server-side warnings for one call.
+
+    Responses aren't always parsed where the caller is waiting: the simple
+    client parses them in the requests session's worker thread, and the async
+    client may flush a context in a background task. Where warnings are
+    context-local (free-threaded Python), emitting them there would hide them
+    from the caller, so each call's warnings are recorded instead, and emitted
+    (once) when the caller retrieves that call's result - or, for calls whose
+    results aren't retrieved one by one, their whole batch's.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = []
+
+    def record(self, message: str):
+        with self._lock:
+            self._pending.append(message)
+
+    def emit(self):
+        with self._lock:
+            pending, self._pending = self._pending, []
+        for message in pending:
+            warnings.warn(message)
+
+
 class SimpleContextFuture(concurrent.futures.Future):
 
     def __init__(self, context: "SimpleContext"):
         super().__init__()
         self._context = context
+        self._warnings = CallWarnings()
 
     def _flush(self, timeout=None):
         # Wait for all preceding futures to return or cancel.
@@ -265,17 +294,24 @@ class SimpleContextFuture(concurrent.futures.Future):
         # Collect the request future here, so that an error from anywhere in
         # the batch is raised by the call that sent it, as with the async
         # client. (A failed request also fails every call's future: see
-        # RequestFuture.)
+        # RequestFuture.) Waiting emits no warnings: only this call's are due,
+        # below.
         if response is not None:
-            response.result(timeout=timeout)
+            response._wait(timeout=timeout)
 
     def result(self, timeout=None):
         self._flush(timeout=timeout)
-        return super().result(timeout=timeout)
+        try:
+            return super().result(timeout=timeout)
+        finally:
+            self._warnings.emit()
 
     def exception(self, timeout=None):
         self._flush(timeout=timeout)
-        return super().exception(timeout=timeout)
+        try:
+            return super().exception(timeout=timeout)
+        finally:
+            self._warnings.emit()
 
 
 class RequestFuture(concurrent.futures.Future):
@@ -286,6 +322,10 @@ class RequestFuture(concurrent.futures.Future):
     once parsed; with the request's error, if it fails (in transit, e.g. by
     timing out, or because the server returned an error); or by cancelling
     them, if it's cancelled before it starts.
+
+    Retrieving its result (or its exception) emits the warnings of any of the
+    request's calls whose results haven't been retrieved already (see
+    CallWarnings).
     """
 
     def __init__(
@@ -337,6 +377,26 @@ class RequestFuture(concurrent.futures.Future):
         # too (see _mirror)
         request = self._request
         return request is not None and request.cancel()
+
+    def _wait(self, timeout=None):
+        """Like result(), but without emitting any warnings."""
+        return super().result(timeout=timeout)
+
+    def _emit_warnings(self):
+        for f in self._futures:
+            f._warnings.emit()
+
+    def result(self, timeout=None):
+        try:
+            return self._wait(timeout=timeout)
+        finally:
+            self._emit_warnings()
+
+    def exception(self, timeout=None):
+        try:
+            return super().exception(timeout=timeout)
+        finally:
+            self._emit_warnings()
 
 
 class SimpleContext:
@@ -467,7 +527,8 @@ class SimpleContext:
         cs = self.obj._tuber_requests_session
 
         # Create a HTTP request to complete the call. The RequestFuture parses
-        # the response (in the requests session's worker thread), and resolves
+        # the response (in the requests session's worker thread, so the calls'
+        # warnings are only recorded there - see CallWarnings), and resolves
         # the calls' futures.
         post_kwargs = dict(json=calls, headers=headers)
         if self.timeout is not None:
@@ -578,44 +639,59 @@ class SimpleContext:
             # best we can: fail the request, which fails its calls too.
             raise TuberRemoteError(getkey(json_out, "error", "message"))
 
+        # Record each call's warnings, if any, with its future: they're emitted
+        # when the caller retrieves the call's result (see CallWarnings). Do so
+        # for the whole batch before resolving any future, so that a caller
+        # woken by one result finds every call's warnings recorded.
         for f, r in zip(futures, json_out):
-            # Always emit warnings, if any occurred
             if haskey(r, "warnings") and getkey(r, "warnings"):
                 for w in getkey(r, "warnings"):
-                    warnings.warn(w)
+                    f._warnings.record(w)
 
+        # Resolve each future, keeping the outcomes to return. (They're kept
+        # here rather than read back from the futures, whose result() is meant
+        # for callers: a SimpleContextFuture's also emits the call's warnings.)
+        outcomes = []
+        for f, r in zip(futures, json_out):
             # A future the caller has cancelled (e.g. via a timeout) can no
-            # longer accept a result - don't let it spoil the batch.
+            # longer accept a result - don't let it spoil the batch. Stand in
+            # with a CancelledError of the future's kind.
             if f.cancelled():
+                cancelled = (
+                    asyncio.CancelledError if isinstance(f, asyncio.Future) else concurrent.futures.CancelledError
+                )
+                outcomes.append((None, cancelled()))
                 continue
 
             # Resolve either a result or an error
             if haskey(r, "error") and getkey(r, "error"):
                 err = getkey(r, "error")
                 if haskey(err, "message"):
-                    f.set_exception(TuberRemoteError(getkey(err, "message")))
+                    e = TuberRemoteError(getkey(err, "message"))
                 else:
-                    f.set_exception(TuberRemoteError("Unknown error"))
+                    e = TuberRemoteError("Unknown error")
+            elif haskey(r, "result"):
+                result = getkey(r, "result")
+                f.set_result(result)
+                outcomes.append((result, None))
+                continue
             else:
-                if haskey(r, "result"):
-                    f.set_result(getkey(r, "result"))
-                else:
-                    f.set_exception(TuberError("Result has no 'result' attribute"))
+                e = TuberError("Result has no 'result' attribute")
+            f.set_exception(e)
+            outcomes.append((None, e))
 
-        # Return a list of results. Futures the caller has cancelled have no
-        # result to collect - stand in with a CancelledError or None so the
-        # rest of the batch is unaffected.
+        # Return a list of results. Cancelled calls have no result to collect:
+        # stand in with their CancelledError, or None, so the rest of the batch
+        # is unaffected.
         if return_exceptions:
-            out = []
-            for f in futures:
-                try:
-                    # This will raise a CancelledError if the future was cancelled
-                    out.append(f.result())
-                except (Exception, asyncio.CancelledError) as e:
-                    out.append(e)
-            return out
+            return [result if e is None else e for result, e in outcomes]
 
-        return [None if f.cancelled() else f.result() for f in futures]
+        out = []
+        for f, (result, e) in zip(futures, outcomes):
+            if e is not None and not f.cancelled():
+                raise e
+            out.append(result)
+        return out
 
     def _receive(
         self,
@@ -729,6 +805,7 @@ class ContextFuture(asyncio.Future):
     def __init__(self, context: "Context"):
         super().__init__(loop=asyncio.get_running_loop())
         self._context = context
+        self._warnings = CallWarnings()
 
     def __await__(self):
         # If we're unresolved and calls (ours among them) are still queued,
@@ -736,10 +813,15 @@ class ContextFuture(asyncio.Future):
         # resolved or a flush is in flight - fall through and wait for it.
         # The flush is shielded because it acts on the whole batch:
         # cancelling one awaiter (e.g. via a timeout) must not abort the
-        # request that other queued calls are counting on.
-        if not self.done() and self._context.calls:
-            yield from asyncio.shield(self._context()).__await__()
-        return (yield from super().__await__())
+        # request that other queued calls are counting on. The shielded flush
+        # runs in a task of its own, so this call's warnings are emitted here,
+        # in the awaiting task, rather than there (see CallWarnings).
+        try:
+            if not self.done() and self._context.calls:
+                yield from asyncio.shield(self._context._send()).__await__()
+            return (yield from super().__await__())
+        finally:
+            self._warnings.emit()
 
     __iter__ = __await__  # make compatible with 'yield from'
 
@@ -790,6 +872,19 @@ class Context(SimpleContext):
         response : list
             List of responses from the server, corresponding to each of the requested
             calls.
+        """
+        # emit the calls' warnings here, in the awaiting task (see CallWarnings)
+        futures = [f for _, f in self.calls]
+        try:
+            return await self._send(convert_json, return_exceptions)
+        finally:
+            for f in futures:
+                f._warnings.emit()
+
+    async def _send(self, convert_json: bool | None = None, return_exceptions: bool | None = None):
+        """Send the queued calls and return their results, as ``__call__()`` does,
+        but only record the calls' warnings (see CallWarnings), rather than
+        emitting them.
         """
 
         # An empty Context returns an empty list of calls
